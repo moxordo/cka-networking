@@ -127,6 +127,38 @@
     font-size:11px;letter-spacing:1.5px;text-transform:uppercase;
     color:var(--accent);font-weight:700;margin-bottom:4px
   }
+  .sidenote{
+    border-left:3px solid #4b5563;
+    background:rgba(75,85,99,0.10);
+    padding:14px 18px;
+    border-radius:0 6px 6px 0;
+    margin:22px 0;
+    max-width:780px;
+    font-size:14px;line-height:1.55
+  }
+  .sidenote .sidenote-label{
+    font-size:11px;letter-spacing:1.5px;text-transform:uppercase;
+    color:var(--muted);font-weight:700;margin-bottom:8px;
+    display:flex;align-items:center;gap:8px
+  }
+  .sidenote .sidenote-label::before{
+    content:"";display:inline-block;width:6px;height:6px;
+    border-radius:50%;background:#7d8a9c
+  }
+  .sidenote h4{
+    margin:14px 0 4px;font-size:12px;color:#a8b3c4;
+    text-transform:uppercase;letter-spacing:.7px;font-weight:600
+  }
+  .sidenote h4:first-of-type{margin-top:6px}
+  .sidenote p{margin:6px 0;max-width:none}
+  .sidenote ul,.sidenote ol{padding-left:22px;margin:6px 0 12px;max-width:none}
+  .sidenote li{margin:4px 0}
+  .sidenote table.cmp{margin:8px 0;font-size:13px;max-width:none;width:100%}
+  .sidenote table.cmp th,.sidenote table.cmp td{padding:7px 10px}
+  .sidenote .footnote{
+    margin-top:12px;padding-top:10px;border-top:1px solid var(--line);
+    color:var(--muted);font-size:13px
+  }
   .analog{
     display:grid;grid-template-columns:160px 1fr;gap:10px 18px;
     margin:16px 0;max-width:780px;font-size:14.5px
@@ -314,6 +346,28 @@
         <tr><td><strong>ipvs</strong></td><td>kube-proxy가 프로그래밍하는 커널 LVS director</td><td>대규모 클러스터(10k+ Services). 해시 기반 O(1) 조회.</td></tr>
       </table>
       <p>모든 모드에서 kube-proxy 자체는 <strong>data plane 트래픽을 처리하지 않습니다</strong>. control-plane 데몬으로서, API server의 Service/Endpoints 객체를 커널 룰로 번역하는 역할만 합니다.</p>
+
+      <div class="sidenote">
+        <div class="sidenote-label">Q&amp;A · iptables가 EndpointSlice인가?</div>
+        <p><strong>아닙니다.</strong> 같은 사실을 다른 레이어에서 묘사하는 두 산출물입니다. <strong>EndpointSlice</strong>는 control plane의 K8s API 객체(etcd에 저장, kube-apiserver가 서빙). <strong>iptables 룰</strong>은 각 Node 커널 메모리에 있는 netfilter 룰. EndpointSlice가 클러스터 전체에 한 번 존재하면, 같은 정보가 N개 Node의 커널에 N번 materialize 됩니다.</p>
+        <h4>업데이트 파이프라인 (Pod 생성 시)</h4>
+        <ol>
+          <li><code class="inline">kubelet</code>이 CNI로 Pod를 네트워크에 연결하고, <code class="inline">pod.status</code>(PodIP, Ready 등)를 업데이트.</li>
+          <li><code class="inline">kube-controller-manager</code> 안의 <strong>EndpointSlice controller</strong>가 Pod의 Ready 조건을 watch — Ready가 되면 Pod IP를 매칭되는 Service의 EndpointSlice에 추가.</li>
+          <li><code class="inline">kube-apiserver</code>가 watch 스트림으로 변경을 fan-out.</li>
+          <li>모든 Node의 <strong>kube-proxy</strong>가 그 watch를 듣고 있다가 변경을 받음.</li>
+          <li>kube-proxy가 <code class="inline">iptables-restore</code>(혹은 IPVS 모드면 <code class="inline">ipvsadm</code>)로 변경된 룰을 적용. sync 주기 단위로 배치 처리 (기본 min 1초, max 30초).</li>
+        </ol>
+        <p>Pod 삭제는 역순: <strong>EndpointSlice에서 IP가 먼저 제거된 다음</strong> 컨테이너에 SIGTERM이 갑니다. 그래야 죽어가는 Pod로 신규 트래픽이 가지 않음. 인플라이트 연결은 conntrack이 보호.</p>
+        <h4>각 산출물의 저장 위치</h4>
+        <ul>
+          <li><strong>EndpointSlice</strong> → etcd. 일반 API 객체처럼 다룹니다: <code class="inline">kubectl get endpointslices -A</code></li>
+          <li><strong>iptables 룰</strong> → 각 Node의 Linux 커널 메모리. 파일이 아닙니다. <code class="inline">iptables-save -t nat</code>로 덤프 가능. 재부팅 시 사라지지만 kube-proxy 시작 시 전체 재동기화하므로 OK.</li>
+        </ul>
+        <h4>역사적 메모</h4>
+        <p>K8s 1.21에서 GA. 그 전엔 Service당 단일 <code class="inline">Endpoints</code> 객체였는데, endpoint가 10k이면 ~1MB 객체가 모든 Node로 매 변경마다 전송돼서 스케일링 실패. EndpointSlice는 그 데이터를 샤딩(기본 max 100/slice)해 변경 전파 비용을 낮춥니다.</p>
+        <div class="footnote"><strong>사이드 효과:</strong> 각 Node의 kube-proxy가 독립적으로 reconcile하므로, rolling update 도중 두 Node가 잠시 다른 endpoint 셋을 가질 수 있습니다(~sync 주기 동안). readiness probe가 잘 걸려 있어도 "구버전/신버전 응답이 잠깐 섞이는 짧은 창"이 보이는 이유.</div>
+      </div>
     </section>
 
     <section class="slide" data-chapter="1" data-highlight="service,iptables,kubeproxy,podeth">
@@ -371,6 +425,46 @@ DNAT  tcp  --  0.0.0.0/0  0.0.0.0/0  tcp to:<span class="str">10.244.1.5:80</spa
         <li>컨테이너가 바인딩된 소켓으로 패킷을 수신합니다.</li>
       </ol>
       <p>아직 회색: Service VIP 위쪽 모든 것, 그리고 DNS 사이드 브랜치. 다음 챕터들의 주제입니다.</p>
+
+      <div class="sidenote">
+        <div class="sidenote-label">Q&amp;A · 그런데 bridge·veth·Pod eth0은 누가 만든 건가요?</div>
+        <p>답: <strong>CNI 플러그인</strong> (Container Network Interface). Pod이 생성될 때 컨테이너 런타임이 호출하는 바이너리입니다. 데몬도 컨트롤러도 아니고 — Pod 생애주기 이벤트마다 한 번씩 실행되는 일회성 프로세스입니다.</p>
+        <h4>호출 순서 (Pod 생성)</h4>
+        <ol>
+          <li><code class="inline">kubelet</code>이 CRI (containerd / CRI-O)에 Pod 시작을 요청.</li>
+          <li>CRI가 빈 network namespace를 만들고, 설정된 CNI 플러그인 바이너리를 호출.</li>
+          <li>CNI 플러그인이 차례로:
+            <ul>
+              <li>IPAM 모듈에서 Pod IP를 할당 (Node의 Pod CIDR 슬라이스에서)</li>
+              <li>host 쪽에 <strong>veth 쌍</strong>을 생성</li>
+              <li>한쪽 끝을 Pod netns로 이동시키고 <code class="inline">eth0</code>로 rename, IP와 라우트 설정</li>
+              <li>다른 쪽 끝을 host의 <strong>bridge</strong>(<code class="inline">cni0</code>) / overlay 디바이스 / routed interface에 연결</li>
+            </ul>
+          </li>
+          <li>결과 JSON (할당된 IP, 라우트, DNS)을 런타임에 반환. kubelet이 이걸 읽어 pod.status에 반영.</li>
+        </ol>
+        <p>맵 하단 절반의 <code class="inline">veth0</code>, <code class="inline">cni0</code>, Pod의 <code class="inline">eth0</code> — 이 박스들이 위 3단계에서 만들어집니다. CNI 실행 전 Pod netns는 비어 있고, 실행 후엔 Pod이 네트워크 위에 있습니다. Pod 삭제 시엔 <code class="inline">CNI_COMMAND=DEL</code>로 다시 호출돼 IP 반납, veth 제거.</p>
+        <h4>설정 위치 (각 Node)</h4>
+        <ul>
+          <li><code class="inline">/opt/cni/bin/</code> — 플러그인 바이너리들</li>
+          <li><code class="inline">/etc/cni/net.d/</code> — JSON 설정 파일 (어떤 플러그인 체인을 쓸지)</li>
+        </ul>
+        <h4>주요 구현체와 Node 간 전략</h4>
+        <table class="cmp">
+          <tr><th>플러그인</th><th>Node 간 트래픽 전략</th></tr>
+          <tr><td><strong>Flannel</strong></td><td>VXLAN overlay — UDP 캡슐화로 터널링. 어디서나 동작.</td></tr>
+          <tr><td><strong>Calico</strong></td><td>BGP — 각 Node가 자기 Pod CIDR을 advertise. 오버레이 없음, 가장 빠름.</td></tr>
+          <tr><td><strong>Cilium</strong></td><td>eBPF — iptables를 커널 프로그램으로 대체. 관측성·정책 강력.</td></tr>
+          <tr><td><strong>AWS VPC CNI</strong></td><td>실제 VPC IP 할당 (ENI secondary IP). 오버레이 없이 VPC에서 라우팅 가능.</td></tr>
+        </table>
+        <h4>K8s 3대 플러그인 인터페이스</h4>
+        <ul>
+          <li><strong>CRI</strong> — Container Runtime Interface (containerd, CRI-O) — 컨테이너 실행</li>
+          <li><strong>CNI</strong> — Container Network Interface (Calico, Cilium…) — 네트워크 연결</li>
+          <li><strong>CSI</strong> — Container Storage Interface (EBS, Ceph…) — 스토리지 마운트</li>
+        </ul>
+        <div class="footnote"><strong>디버깅 분리법:</strong> Pod에 IP가 없거나 다른 Node Pod에 못 닿으면 → <em>CNI</em> 문제. Pod-to-Pod는 되는데 Service만 안 되면 → <em>kube-proxy</em> 문제. CNI가 끊어지면 패킷은 kube-proxy 룰까지 도달조차 못합니다.</div>
+      </div>
     </section>
 
     <!-- ═══════════════ CHAPTER 2 ═══════════════ -->
