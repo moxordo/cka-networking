@@ -822,7 +822,7 @@ spec:
   │   • 패킷을 실제로 보는 유일한 컴포넌트  │
   │   • TLS 종료, HTTP 파싱, backend 선택  │
   └──────────────────────────────────────┘</div>
-      <p>K8s-specific한 부분은 <strong>② 뿐</strong>입니다. ①은 그냥 etcd 객체이고, ③은 평범한 reverse proxy입니다. 이걸 머리에 박아두면 다음 슬라이드들이 자연스럽게 이해됩니다.</p>
+      <p>K8s-specific한 부분은 <strong>② 뿐</strong>입니다. ①은 그냥 etcd 객체이고, ③은 평범한 reverse proxy입니다. 이걸 머리에 박아두고 다음 슬라이드에서 그 ②와 ③이 실제로 어떻게 한 Pod 안에 공존하는지 봅시다.</p>
       <div class="callout">
         <div class="label">한 문장으로</div>
         Ingress Controller는 <strong>"K8s API를 보고 프록시 설정을 갱신하는 Go 로봇 + 그 옆에서 실제로 패킷을 처리하는 nginx"</strong>의 결합체입니다. CRD는 그 로봇이 읽는 입력일 뿐, 그 자체로 라우팅을 하지는 않습니다.
@@ -851,80 +851,6 @@ PID  CMD
         <div class="label">즉</div>
         nginx는 여전히 nginx입니다. K8s를 한 글자도 모릅니다. controller가 K8s를 통역해서 nginx가 알아들을 수 있는 유일한 언어 — <code class="inline">nginx.conf</code> — 로 번역해 주는 겁니다.
       </div>
-    </section>
-
-    <section class="slide" data-chapter="4" data-highlight="ingress">
-      <span class="chap-tag">Ch 4 · 내부 작동</span>
-      <h1>Controller는 "robot sysadmin"이다</h1>
-      <h2>Reconciliation 루프 + SIGHUP graceful reload</h2>
-      <p>Controller의 일은 한 줄 요약하면 무한 루프 하나입니다:</p>
-<pre>loop:
-  event = watch_stream.next()        <span class="cmt"># CRD / Service / EndpointSlice 변경</span>
-  desired = compute_nginx_conf(      <span class="cmt"># K8s 객체 → 프록시 설정</span>
-              ingresses, services,
-              endpointslices, secrets)
-  if desired != current:
-    write_to_disk(desired)           <span class="cmt"># /etc/nginx/nginx.conf 갱신</span>
-    exec("nginx -s reload")          <span class="cmt"># → SIGHUP to PID 8 (nginx master)</span>
-    current = desired</pre>
-      <p>SIGHUP을 받은 nginx master가 하는 일:</p>
-      <ol>
-        <li>새 <code class="inline">nginx.conf</code>를 디스크에서 다시 읽음.</li>
-        <li>새 설정으로 <strong>새 worker 프로세스들을 spawn</strong>.</li>
-        <li>옛 worker들은 기존 연결을 끝까지 처리한 다음 <strong>graceful exit</strong>. 연결이 끊기지 않음.</li>
-        <li>새 요청부터는 새 룰로 처리.</li>
-      </ol>
-      <div class="callout">
-        <div class="label">왜 SIGHUP인가</div>
-        nginx의 2002년 Unix daemon 디자인을 그대로 활용한 겁니다. nginx는 원래 "sysadmin이 <code class="inline">nginx.conf</code>를 수정한 다음 <code class="inline">nginx -s reload</code>"를 가정하고 설계됐습니다. ingress-nginx의 Go controller는 문자 그대로 <strong>그 sysadmin 역할을 자동화한 로봇</strong>입니다 — 같은 컨테이너 안에서 nginx.conf를 생성하고 reload 명령을 대신 내려주는.
-      </div>
-    </section>
-
-    <section class="slide" data-chapter="4" data-highlight="ingress,service,podeth">
-      <span class="chap-tag">Ch 4 · 내부 작동</span>
-      <h1>Lua escape hatch</h1>
-      <h2>Endpoint 변경은 SIGHUP을 거치지 않는다</h2>
-      <p><strong>문제:</strong> HPA의 scale, rolling update, restart 때마다 Pod IP가 바뀝니다. 매번 SIGHUP을 거치면:</p>
-      <ul>
-        <li>전체 nginx.conf 재생성 + 디스크 I/O 비용</li>
-        <li>워커 turnover로 인한 메모리 spike</li>
-        <li>Long-lived 연결 (websocket, gRPC streaming)에 대한 미묘한 edge case</li>
-      </ul>
-      <p><strong>해결:</strong> ingress-nginx는 nginx 안에 <strong>OpenResty (Lua) 모듈</strong>을 박아두고, controller가 변경 종류에 따라 두 경로 중 하나를 씁니다.</p>
-      <table class="cmp">
-        <tr><th>변경 종류</th><th>적용 경로</th></tr>
-        <tr><td><strong>구조적 변경</strong><br><span style="color:var(--muted);font-size:13px">새 Ingress, path 추가, TLS cert 교체</span></td><td><code class="inline">nginx.conf</code> 재작성 → <code class="inline">nginx -s reload</code> (SIGHUP)</td></tr>
-        <tr><td><strong>Endpoint-only 변경</strong><br><span style="color:var(--muted);font-size:13px">Pod scale / reschedule / restart</span></td><td>nginx 내 Lua endpoint에 HTTP로 새 IP 리스트 push → <strong>공유 메모리 dict 직접 갱신</strong>. SIGHUP 없음.</td></tr>
-      </table>
-      <p>운영적 핵심은 분리 자체입니다: <strong>"Steady-state churn은 메모리 push, YAML 변경은 reload."</strong> Deployment 변경 없이 Pod만 굴러다니는 동안은 nginx가 한 번도 reload하지 않으면서 endpoint set만 업데이트합니다. 대규모 클러스터에서 ingress-nginx가 견디는 핵심 메커니즘입니다.</p>
-      <div class="callout">
-        <div class="label">데이터 출처</div>
-        그 IP 리스트는 <em>EndpointSlice</em>에서 옵니다 — controller가 EndpointSlice watch로 받은 변경을 Lua로 push하는 거예요. Ch 1의 "iptables가 EndpointSlice인가?" Q&amp;A에서 본 그 EndpointSlice 컨트롤러 파이프라인이 여기서 다시 등장합니다.
-      </div>
-    </section>
-
-    <section class="slide" data-chapter="4" data-highlight="ingress">
-      <span class="chap-tag">Ch 4 · 내부 작동</span>
-      <h1>Envoy + xDS</h1>
-      <h2>Dynamic config가 native인 세계 — Ch 6 미리보기</h2>
-      <p>nginx의 SIGHUP + Lua 조합은 본질적으로 <em>"정적 config 기반 프록시에 동적 갱신을 끼워넣기"</em>를 위한 workaround였습니다. Envoy는 처음부터 "런타임 동적 config"를 전제로 설계됐습니다.</p>
-      <p>Envoy의 dynamic config API는 <strong>xDS</strong> (gRPC 스트리밍)입니다:</p>
-      <ul>
-        <li><strong>LDS</strong> — Listener Discovery Service (listener 추가/제거)</li>
-        <li><strong>CDS</strong> — Cluster Discovery Service (upstream cluster 정의)</li>
-        <li><strong>EDS</strong> — Endpoint Discovery Service (cluster의 endpoint 갱신 — Pod IP 변경)</li>
-        <li><strong>RDS</strong> — Route Discovery Service (host/path 매칭 룰)</li>
-        <li><strong>SDS</strong> — Secret Discovery Service (TLS cert)</li>
-      </ul>
-<div class="ascii">  nginx 방식:
-    controller ──write──> nginx.conf ──(SIGHUP)──> nginx
-    (파일 + 시그널 + Lua 패치)
-
-  envoy 방식:
-    controller ──gRPC stream──> envoy (xDS API)
-    (메모리 객체 push. 파일 없음, 시그널 없음, reload 없음.)</div>
-      <p>파일·시그널·Lua dict 모두 불필요합니다. controller가 새 endpoint나 route를 envoy의 xDS 포트로 push하면, envoy가 그 즉시 자기 라우팅 테이블을 atomic하게 교체합니다.</p>
-      <p>바로 이게 <strong>Istio, Contour, Envoy Gateway, NGINX Gateway Fabric 등 대부분의 새 Gateway API 구현체가 envoy를 데이터 플레인으로 선택한 구조적 이유</strong>입니다 — annotation 사투리만의 문제가 아니라, 동적 config 모델 자체가 다릅니다. (Ch 6에서 다시 만남.)</p>
     </section>
 
     <!-- ═══════════════ CHAPTER 5 ═══════════════ -->
